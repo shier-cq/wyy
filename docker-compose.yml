@@ -1,0 +1,57 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: netease-musician-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./redis-data:/data
+    networks:
+      - netease-musician
+
+  netease-musician-task:
+    image: xinghehy/netease-musician-task:latest
+    container_name: netease-musician-task
+    restart: unless-stopped
+    shm_size: "512mb"
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    volumes:
+      - ./log:/app/log
+      - ./playwright_profiles:/app/playwright_profiles
+      - ./debug:/app/debug
+      - ./login.py:/app/playwright_handle/login.py
+    networks:
+      - netease-musician
+
+  admin-panel:
+    build:
+      context: ./admin-panel
+    container_name: netease-musician-admin
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - netease-musician-task
+    env_file:
+      - .env
+    environment:
+      ENV_FILE_PATH: /project/.env
+      REDIS_URL: redis://redis:6379/5
+      TASK_CONTAINER: netease-musician-task
+      TASK_IMAGE: xinghehy/netease-musician-task:latest
+      REDIS_CONTAINER: netease-musician-redis
+      TASK_SHM_SIZE: "536870912"
+      PROJECT_HOST_DIR: ${PROJECT_HOST_DIR:-/opt/netease-musician-task}
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./:/project
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - netease-musician
+
+networks:
+  netease-musician:
+    name: netease-musician

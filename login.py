@@ -1,0 +1,1236 @@
+"""
+使用 Playwright 打开网易云音乐 **手机号密码登录页**，自动完成你描述的所有点击和输入，
+并把登录后的 Cookie 保存到 Redis（供 core.py/main.py 复用）。
+
+使用前先在文件最上面改成你自己的手机号、密码、可选 uid。
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import random
+import re
+import sys
+import time
+import logging
+import urllib.parse
+from typing import Optional
+
+# 项目根目录；单独执行 python playwright_handle/login.py 时须先把根目录加入 path，否则找不到 core
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from ddddocr import DdddOcr
+from playwright.sync_api import sync_playwright, Page, Frame
+
+from core import NeteaseClient  # 仅用于本模块内部根据 Cookie 识别 uid
+
+logger = logging.getLogger("netease_music")
+
+
+class NeteaseLoginNetworkRiskError(RuntimeError):
+    """页面提示网络环境安全风险时抛出，避免被滑块流程的 broad except 吞掉。"""
+
+
+# ======== 按需修改这里（作为脚本单独运行时使用） ========
+LOGIN_URL = "https://music.163.com/#/login?targetUrl=https%3A%2F%2Fmusic.163.com%2Fst%2Fmusician"
+
+# 作为脚本直接运行时的默认账号（集成到 main.py 时会传参覆盖）
+
+
+# 如果你知道自己的 uid，可以直接填；否则留 None，由后续逻辑识别
+FIXED_UID: Optional[int] = None
+
+# Playwright 持久化用户目录（可复用登录态，默认在项目根目录）
+PROFILE_DIR = os.path.join(_PROJECT_ROOT, ".playwright_profiles")
+SECONDARY_STATUS_PATH = os.getenv(
+    "SECONDARY_STATUS_PATH",
+    os.path.join(_PROJECT_ROOT, "debug", "secondary_status.json"),
+)
+SECONDARY_INPUT_PATH = os.getenv(
+    "SECONDARY_INPUT_PATH",
+    os.path.join(_PROJECT_ROOT, "debug", "secondary_input.json"),
+)
+
+
+# ======== 工具函数 ========
+
+
+def _phone_debug_subdir(phone: str) -> str:
+    """用于 debug 目录名，避免路径非法字符。"""
+    s = re.sub(r"[^\d+]+", "_", (phone or "").strip())
+    return s.strip("_") or "unknown"
+
+
+def save_login_debug_screenshot(page: Page | Frame, phone: str, tag: str) -> Optional[str]:
+    """
+    登录失败或异常场景截图，保存到 **项目根目录** 下 debug/{phone}/（不写入 playwright_handle）。
+    tag 仅用于文件名（会净化非法字符）。
+    """
+    if not phone:
+        return None
+    try:
+        pw_page: Page = page if isinstance(page, Page) else page.page
+        sub = _phone_debug_subdir(phone)
+        out_dir = os.path.join(_PROJECT_ROOT, "debug", sub)
+        os.makedirs(out_dir, exist_ok=True)
+        safe_tag = re.sub(r"[^\w\-.]+", "_", tag).strip("_")[:80] or "shot"
+        name = f"{time.strftime('%Y%m%d_%H%M%S')}_{safe_tag}.png"
+        path = os.path.join(out_dir, name)
+        pw_page.screenshot(path=path, full_page=True)
+        logger.info(f"[登录调试] 已保存截图：{path}")
+        return path
+    except Exception as e:
+        logger.warning(f"[登录调试] 截图失败：{e}")
+        return None
+
+
+def cookies_to_cookie_str(cookies: list[dict]) -> str:
+    # 只拼接 name/value；domain/path/expiry 不需要给 requests 用
+    pairs = []
+    for c in cookies:
+        name = c.get("name")
+        value = c.get("value")
+        if name and value is not None:
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def try_get_uid_from_cookie(cookie_str: str) -> Optional[int]:
+    """
+    尝试用 Cookie 换取当前登录用户的 uid。
+    """
+    client = NeteaseClient(cookie_str=cookie_str)
+
+    candidates = [
+        ("GET", "/api/nuser/account/get", False, None),
+        ("GET", "/api/w/nuser/account/get", False, None),
+        ("GET", "/api/v1/user/info", False, None),
+        ("POST", "/weapi/w/nuser/account/get", True, {}),
+    ]
+
+    for method, path, encrypt, data in candidates:
+        try:
+            res = client.request(method, path, data=data, encrypt=encrypt)
+        except Exception as e:
+            logger.warning(f"尝试获取 uid 失败：{method} {path} - {e}")
+            continue
+
+        if not isinstance(res, dict):
+            continue
+
+        uid = None
+        account = res.get("account") or {}
+        profile = res.get("profile") or {}
+        if isinstance(account, dict):
+            uid = account.get("id") or uid
+        if isinstance(profile, dict):
+            uid = profile.get("userId") or uid
+
+        try:
+            if uid is not None:
+                return int(uid)
+        except Exception:
+            pass
+
+    return None
+
+
+def _scopes(page: Page | Frame):
+    """
+    返回可操作的 scope：优先 main frame，再遍历所有子 frame。
+    这样弹窗在主文档/不同 frame 时都能继续流程。
+    """
+    yield page
+    for fr in page.frames:
+        if fr is page.main_frame:
+            continue
+        yield fr
+
+
+def _click_first(page: Page | Frame, locator_or_text: str, *, exact_text: bool = False, timeout: int = 15000):
+    """
+    在 main frame + 所有 iframe 中，找到第一个可点击的目标并点击。
+    - locator_or_text: 支持 "text=xxx" / css / xpath 等；若 exact_text=True 则按纯文本匹配
+    """
+    # 关键点：登录弹窗/内部 frame 可能是“点击后才动态创建”的
+    # 因此需要在 timeout 内不断重扫所有 frame，直到找到目标元素
+    deadline = time.time() + max(1, timeout / 1000)
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        for scope in _scopes(page):
+            try:
+                if exact_text:
+                    loc = scope.get_by_text(locator_or_text, exact=True)
+                else:
+                    loc = scope.locator(locator_or_text)
+                if loc.count() == 0:
+                    continue
+                loc.first.wait_for(state="visible", timeout=5000)
+                loc.first.click()
+                return scope
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.1)
+    raise last_err or RuntimeError(f"无法点击目标：{locator_or_text}")
+
+
+def _try_click_if_visible(page: Page | Frame, text: str, *, exact_text: bool = True, timeout_ms: int = 3000) -> bool:
+    """
+    若在 timeout 内找到可点击的文本则点击并返回 True，否则不抛错、返回 False。
+    用于「有则点一下」的场景（如滑块成功后可能再次出现「密码登录」选项卡）。
+    """
+    deadline = time.time() + max(0.5, timeout_ms / 1000)
+    while time.time() < deadline:
+        for scope in _scopes(page):
+            try:
+                if exact_text:
+                    loc = scope.get_by_text(text, exact=True)
+                else:
+                    loc = scope.locator(f"text={text}")
+                if loc.count() == 0:
+                    continue
+                loc.first.wait_for(state="visible", timeout=500)
+                loc.first.click()
+                return True
+            except Exception:
+                continue
+        time.sleep(0.2)
+    return False
+
+
+def _write_secondary_status(payload: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(SECONDARY_STATUS_PATH), exist_ok=True)
+        tmp_path = f"{SECONDARY_STATUS_PATH}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, SECONDARY_STATUS_PATH)
+    except Exception as e:
+        logger.warning(f"[二次验证] 写入状态文件失败：{e}")
+
+
+def _clear_secondary_status() -> None:
+    for path in (SECONDARY_STATUS_PATH, SECONDARY_INPUT_PATH):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
+def _read_secondary_code() -> str:
+    try:
+        with open(SECONDARY_INPUT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        code = re.sub(r"\D+", "", str(data.get("code") or ""))
+        return code[:8]
+    except Exception:
+        return ""
+
+
+def _read_secondary_input() -> dict:
+    try:
+        with open(SECONDARY_INPUT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_sms_send_instruction(text: str) -> dict:
+    match = re.search(r"发送短信\s*([A-Za-z0-9]+)\s*到\s*(\d{5,})", text or "")
+    if not match:
+        return {}
+    return {
+        "smsText": match.group(1),
+        "smsTo": match.group(2),
+    }
+
+
+def _visible_text_excerpt(page: Page | Frame, limit: int = 800) -> str:
+    parts = []
+    for scope in _scopes(page):
+        try:
+            text = scope.locator("body").inner_text(timeout=1500)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                parts.append(text)
+        except Exception:
+            continue
+    merged = " | ".join(parts)
+    return merged[:limit]
+
+
+def _click_sms_send_button(page: Page | Frame) -> bool:
+    text_candidates = (
+        "获取验证码",
+        "发送验证码",
+        "重新发送",
+        "获取短信验证码",
+        "发送短信验证码",
+        "免费获取",
+        "获取",
+        "发送",
+    )
+    for send_text in text_candidates:
+        if _try_click_if_visible(page, send_text, exact_text=False, timeout_ms=1200):
+            logger.info(f"[二次验证] 已点击「{send_text}」")
+            return True
+
+    selectors = (
+        "button",
+        "a",
+        "[role='button']",
+        ".mrc-btn",
+        "[class*='btn']",
+        "[class*='Btn']",
+        "span",
+        "div",
+    )
+    keywords = ("验证码", "短信", "获取", "发送", "重发")
+    for scope in _scopes(page):
+        for selector in selectors:
+            try:
+                nodes = scope.locator(selector)
+                count = min(nodes.count(), 80)
+                for index in range(count):
+                    node = nodes.nth(index)
+                    try:
+                        if not node.is_visible(timeout=250):
+                            continue
+                        text = re.sub(r"\s+", "", node.inner_text(timeout=500))
+                        if not text or not any(keyword in text for keyword in keywords):
+                            continue
+                        node.click(timeout=1500)
+                        logger.info(f"[二次验证] 已点击疑似发送验证码控件：{text[:30]}")
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    return False
+
+
+NETWORK_SECURITY_RISK_TEXT = "您当前的网络环境存在安全风险"
+
+
+def _is_network_security_risk_visible(page: Page | Frame) -> bool:
+    """
+    登录后若出现「您当前的网络环境存在安全风险」，易与「未出现滑块」混淆。
+    在所有 frame 中检测该文案是否可见。
+    """
+    try:
+        for scope in _scopes(page):
+            loc = scope.get_by_text(NETWORK_SECURITY_RISK_TEXT, exact=True)
+            if loc.count() == 0:
+                continue
+            try:
+                if loc.first.is_visible():
+                    return True
+            except Exception:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_no_network_security_risk(
+    page: Page | Frame, *, where: str = "", debug_phone: Optional[str] = None
+) -> None:
+    """
+    若检测到网络环境安全风险提示，记录日志并终止自动登录（换 IP/代理通常才能恢复）。
+    """
+    if not _is_network_security_risk_visible(page):
+        return
+    suffix = f"（{where}）" if where else ""
+    logger.error(
+        f"[登录风控]{suffix} 页面提示「{NETWORK_SECURITY_RISK_TEXT}」，"
+        "自动流程无法继续，请更换网络、关闭代理或使用更干净的环境后重试。"
+    )
+    if debug_phone:
+        wt = re.sub(r"[^\w\-.]+", "_", where)[:40] if where else ""
+        save_login_debug_screenshot(page, debug_phone, f"network_risk_{wt}" if wt else "network_risk")
+    raise NeteaseLoginNetworkRiskError(NETWORK_SECURITY_RISK_TEXT)
+
+
+def _has_yidun_slider_modal(page: Page | Frame) -> bool:
+    """
+    快速判断是否出现 yidun 滑块弹窗/容器（不等待，只做存在性检测）。
+    用于避免重复调用 solve_slider_captcha() 造成多次“未触发验证码”的噪音与耗时。
+    """
+    try:
+        for scope in _scopes(page):
+            if scope.locator(".yidun_modal__body, .yidun.yidun-custom").count() > 0:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _fill_first(page: Page | Frame, selector: str, value: str, *, timeout: int = 15000):
+    deadline = time.time() + max(1, timeout / 1000)
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        for scope in _scopes(page):
+            try:
+                loc_all = scope.locator(selector)
+                if loc_all.count() == 0:
+                    continue
+                loc = loc_all.first
+                loc.wait_for(state="visible", timeout=500)
+                loc.fill(value)
+                return scope
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.1)
+    raise last_err or RuntimeError(f"无法输入：{selector}")
+
+
+def _check_first(page: Page | Frame, selector: str, *, timeout: int = 15000):
+    deadline = time.time() + max(1, timeout / 1000)
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        for scope in _scopes(page):
+            try:
+                loc_all = scope.locator(selector)
+                if loc_all.count() == 0:
+                    continue
+                loc = loc_all.first
+                loc.wait_for(state="attached", timeout=500)
+                loc.check(force=True)
+                return scope
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.1)
+    raise last_err or RuntimeError(f"无法勾选：{selector}")
+
+
+def solve_slider_captcha(page: Page | Frame, max_retry: int = 3, *, debug_phone: Optional[str] = None):
+    """
+    网易云 yidun 滑块高成功率版本（修复 OpenCV 尺寸断言错误）
+    - 真滑块判断（naturalWidth）
+    - 直接下载原图（非 screenshot）
+    - 小尺寸偏移修正
+    - 人类拖动轨迹
+    - 新增尺寸校验：确保滑块图 ≤ 背景图（解决 OpenCV 断言错误）
+    """
+
+    def safe_refresh(scope) -> None:
+        try:
+            refresh = scope.locator(".yidun_refresh").first
+            if refresh.count() > 0 and refresh.is_visible(timeout=500):
+                refresh.click(timeout=1000)
+                time.sleep(1)
+        except Exception as e:
+            logger.info(f"[滑块] 刷新按钮不可用，跳过刷新：{e}")
+
+    def wait_real_image(scope, selector, min_width=120, timeout=5000):
+        scope.wait_for_function(
+            f"""
+            () => {{
+                const img = document.querySelector("{selector}");
+                return img && img.complete && img.naturalWidth > {min_width};
+            }}
+            """,
+            timeout=timeout
+        )
+
+    def download_img(scope, selector) -> bytes:
+        src = scope.locator(selector).first.get_attribute("src")
+        if not src:
+            raise RuntimeError("图片 src 为空")
+        import requests
+        # 1. 下载图片并解析尺寸
+        resp = requests.get(src, timeout=10)
+        resp.raise_for_status()
+        # 2. 用PIL校验图片实际尺寸（避免naturalWidth欺骗）
+        from io import BytesIO
+        from PIL import Image
+        try:
+            img = Image.open(BytesIO(resp.content))
+            img_width, img_height = img.size
+            # 3. 强制校验：背景图≥100x100，滑块图≥30x30（根据网易云实际情况调整）
+            if "bg-img" in selector and (img_width < 100 or img_height < 100):
+                raise RuntimeError(f"背景图尺寸异常：{img_width}x{img_height}")
+            if "jigsaw" in selector and (img_width < 30 or img_height < 30):
+                raise RuntimeError(f"滑块图尺寸异常：{img_width}x{img_height}")
+        except Exception as e:
+            # 4. 尺寸异常：自动点击刷新按钮，并重抛异常触发重试
+            logger.warning(f"图片尺寸校验失败，尝试刷新验证码：{e}")
+            safe_refresh(scope)
+            raise RuntimeError(f"图片无效，已刷新：{e}")
+        return resp.content
+
+    def is_sms_mode(scope):
+        return scope.locator(".yidun_smsbox, .yidun_voice").count() > 0
+
+    # 等验证码弹窗（同时排除：仅有风控文案、无滑块）
+    modal_found = False
+    for _ in range(30):
+        ensure_no_network_security_risk(page, where="等待滑块验证码期间", debug_phone=debug_phone)
+        for scope in _scopes(page):
+            if scope.locator(".yidun_modal__body, .yidun.yidun-custom").count() > 0:
+                modal_found = True
+                break
+        if modal_found:
+            break
+        time.sleep(0.3)
+
+    if not modal_found:
+        ensure_no_network_security_risk(page, where="确认无滑块弹窗前", debug_phone=debug_phone)
+        logger.info("未触发验证码，跳过滑块验证")
+        if debug_phone:
+            save_login_debug_screenshot(page, debug_phone, "no_captcha")
+        return
+
+    # 优先使用 ddddocr 的 slide_match（修正参数顺序 + 尺寸校验，避免其内部 OpenCV 断言）
+    # 同时保留 OpenCV 匹配作为兜底方案
+    ocr = DdddOcr(det=False, ocr=False, show_ad=False)
+    import cv2
+    import numpy as np
+
+    for attempt in range(1, max_retry + 1):
+        logger.info(f"[滑块] 第 {attempt} 次尝试")
+
+        for scope in _scopes(page):
+            try:
+                # 等待真实图片加载（避免加载占位图）
+                wait_real_image(scope, "img.yidun_bg-img")
+                wait_real_image(scope, "img.yidun_jigsaw", min_width=40)
+
+                # 下载背景图和滑块图
+                bg_bytes = download_img(scope, "img.yidun_bg-img")
+                slider_bytes = download_img(scope, "img.yidun_jigsaw")
+
+                # 校验图片有效性
+                if len(bg_bytes) < 5000 or len(slider_bytes) < 1000:
+                    raise RuntimeError(f"图片异常（背景图大小：{len(bg_bytes)}，滑块图大小：{len(slider_bytes)}）")
+
+                # ========== 核心修复：尺寸校验 + ddddocr 优先，OpenCV 匹配兜底 ==========
+                # 将字节流转换为 OpenCV 灰度图像
+                bg_img = cv2.imdecode(np.frombuffer(bg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+                slider_img = cv2.imdecode(np.frombuffer(slider_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+
+                if bg_img is None or slider_img is None:
+                    raise RuntimeError("OpenCV 无法解码验证码图片")
+
+                # 获取图片尺寸（高, 宽）
+                bg_h, bg_w = bg_img.shape[:2]
+                slider_h, slider_w = slider_img.shape[:2]
+                logger.info(f"[滑块] 图片尺寸 - 背景图：{bg_w}x{bg_h}，滑块图：{slider_w}x{slider_h}")
+
+                # 确保模板（滑块）不会比背景图大，避免 ddddocr / OpenCV matchTemplate 尺寸断言错误
+                if slider_w > bg_w or slider_h > bg_h:
+                    raise RuntimeError(
+                        f"滑块图尺寸超过背景图（{slider_w}x{slider_h} > {bg_w}x{bg_h}），跳过本次匹配"
+                    )
+
+                # 优先使用 ddddocr 的 slide_match：
+                # 关键点：按照“小图在前、背景在后”的顺序传参，避免其内部 OpenCV 尺寸断言
+                try:
+                    res = ocr.slide_match(slider_bytes, bg_bytes)
+                    target_x = float(res["target"][0])
+                    logger.info(f"[滑块] ddddocr 识别位移：{target_x:.2f} 像素")
+                except Exception as e:
+                    logger.warning(f"[滑块] ddddocr.slide_match 失败：{e}，改用 OpenCV 匹配")
+                    # 使用 OpenCV 模板匹配查找滑块在背景图中的 X 方向偏移
+                    result = cv2.matchTemplate(bg_img, slider_img, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                    target_x = max_loc[0]
+                    logger.info(f"[滑块] OpenCV 匹配得分：{max_val:.4f}，原始位移：{target_x:.2f} 像素")
+
+                # 小尺寸 yidun 偏移修正（关键）
+                target_x *= 1.03
+                target_x += 3.5
+                logger.info(f"[滑块] 修正后位移：{target_x:.2f} 像素")
+
+                # 获取滑块位置，准备拖动
+                slider = scope.locator(".yidun_slider__icon").first
+                box = slider.bounding_box()
+                if not box:
+                    raise RuntimeError("无法获取滑块位置，跳过本次拖动")
+
+                start_x = box["x"] + box["width"] / 2
+                start_y = box["y"] + box["height"] / 2
+
+                # 人类模拟拖动轨迹（避免被风控）
+                page.mouse.move(start_x, start_y)
+                page.mouse.down()
+
+                total = target_x
+                cur = 0
+                while cur < total:
+                    step = min(total - cur, max(2, cur * 0.08))  # 先慢后快
+                    cur += step
+                    # 轻微上下抖动，模拟人类操作
+                    page.mouse.move(start_x + cur, start_y + (0.5 - time.time() % 1))
+                    time.sleep(0.015)
+
+                # 轻微回拉（反机器人风控）
+                page.mouse.move(start_x + total - 2, start_y, steps=2)
+                time.sleep(0.05)
+                page.mouse.move(start_x + total, start_y, steps=2)
+
+                page.mouse.up()
+                time.sleep(2)  # 等待验证结果
+
+                # 验证成功判断：滑块元素消失
+                if scope.locator(".yidun_slider__icon").count() == 0:
+                    logger.info("[滑块] 验证码验证成功！")
+                    return
+
+                # 验证失败，刷新验证码后重试：必须 break 出内层 scope 循环，下一轮 attempt 再重新扫 scope 等新图
+                if attempt < max_retry:
+                    logger.info(f"[滑块] 第 {attempt} 次失败，刷新验证码重试")
+                    safe_refresh(scope)
+                    if debug_phone:
+                        save_login_debug_screenshot(page, debug_phone, f"slider_failed_attempt_{attempt}")
+                    break  # 跳出 for scope，进入下一 attempt，重新从第一个 scope 开始等新图
+            except cv2.error as e:
+                # 捕获 OpenCV 相关错误，单独兜底
+                logger.warning(f"[滑块] OpenCV 处理失败：{str(e)}，跳过本次尝试")
+                if attempt < max_retry:
+                    time.sleep(1)
+                continue
+            except Exception as e:
+                # 捕获其他所有异常，避免流程中断
+                logger.warning(f"[滑块] 第 {attempt} 次尝试失败：{str(e)}")
+                if debug_phone:
+                    save_login_debug_screenshot(page, debug_phone, f"slider_exception_attempt_{attempt}")
+                continue
+
+    logger.error(f"[滑块] 累计 {max_retry} 次尝试均失败，放弃滑块验证（请手动完成或检查网络/验证码样式）")
+    if debug_phone:
+        save_login_debug_screenshot(page, debug_phone, "slider_failed")
+
+
+def check_secondary_verification(
+    page: Page | Frame,
+    timeout: int = 10,
+    *,
+    auto_action: bool = True,
+    debug_phone: Optional[str] = None,
+) -> bool:
+    """
+    检查是否需要二次验证（登录安全验证弹窗）。
+    如果出现二次验证弹窗，记录日志并返回 True。
+    
+    返回:
+        True: 检测到二次验证弹窗
+        False: 未检测到二次验证弹窗
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for scope in _scopes(page):
+            try:
+                modal = scope.locator(".mrc-modal-container")
+                title = scope.get_by_text("登录安全验证", exact=False)
+                
+                # 有时弹窗标题文案会变化，不能强依赖 title；只要容器存在就认为进入二次验证流程
+                if modal.count() > 0:
+                    logger.warning("[二次验证] 检测到登录安全验证弹窗，需要额外验证")
+                    pw_page: Page = page if isinstance(page, Page) else page.page
+
+                    if not auto_action:
+                        return True
+                    
+                    # 检查可用的验证方式
+                    verification_options = scope.locator(".mjZhxAab")
+                    option_count = verification_options.count()
+                    
+                    if option_count > 0:
+                        logger.info(f"[二次验证] 发现 {option_count} 种验证方式")
+                        preferred_method = os.getenv("SECONDARY_VERIFY_METHOD", "device_confirm").strip().lower()
+
+                        def try_sms_code() -> Optional[bool]:
+                            for j in range(option_count):
+                                try:
+                                    candidate = verification_options.nth(j)
+                                    candidate_text = candidate.locator("span.DwyRKeOe").first.inner_text(timeout=1000)
+                                    if "短信" not in candidate_text and "手机" not in candidate_text:
+                                        continue
+
+                                    logger.info("[二次验证] 尝试点击「短信验证」")
+                                    candidate.click()
+                                    time.sleep(2)
+                                    if debug_phone:
+                                        save_login_debug_screenshot(pw_page, debug_phone, "secondary_sms_page")
+                                    sms_page_text = _visible_text_excerpt(pw_page)
+                                    sms_instruction = _extract_sms_send_instruction(sms_page_text)
+                                    logger.info(f"[二次验证] 短信页可见文字：{sms_page_text}")
+                                    send_clicked = _click_sms_send_button(pw_page)
+                                    if send_clicked:
+                                        time.sleep(1)
+                                    if not send_clicked:
+                                        logger.warning("[二次验证] 未找到发送短信验证码按钮，可能页面已自动发送或按钮文案变化")
+
+                                    now = int(time.time())
+                                    _write_secondary_status(
+                                        {
+                                            "type": "sms",
+                                            "phone": debug_phone or "",
+                                            "createdAt": now,
+                                            "expiresAt": now + 300,
+                                            "message": (
+                                                "请按页面要求从绑定手机发送短信，然后在控制台点击已发送。"
+                                                if sms_instruction
+                                                else "已触发短信验证，请在控制台输入收到的手机验证码。"
+                                            ),
+                                            "sendClicked": send_clicked,
+                                            "mode": "send_sms" if sms_instruction else "code",
+                                            **sms_instruction,
+                                        }
+                                    )
+                                    if sms_instruction:
+                                        logger.warning(
+                                            "[二次验证] 请用绑定手机号发送短信 "
+                                            f"{sms_instruction['smsText']} 到 {sms_instruction['smsTo']}，"
+                                            "发送后在控制台点击已发送"
+                                        )
+                                    else:
+                                        logger.warning("[二次验证] 已触发短信验证，请在控制台输入收到的手机验证码")
+
+                                    deadline = time.time() + 300
+                                    while time.time() < deadline:
+                                        secondary_input = _read_secondary_input()
+                                        if sms_instruction and secondary_input.get("sent"):
+                                            logger.info("[二次验证] 控制台确认已发送短信，准备点击「已发送，立即登录」")
+                                            confirmed = False
+                                            for confirm_text in ("已发送，立即登录", "已发送", "立即登录"):
+                                                if _try_click_if_visible(pw_page, confirm_text, exact_text=False, timeout_ms=2000):
+                                                    confirmed = True
+                                                    break
+                                            if not confirmed:
+                                                logger.warning("[二次验证] 未找到「已发送，立即登录」按钮")
+                                                time.sleep(2)
+                                                continue
+                                            time.sleep(5)
+                                            _clear_secondary_status()
+                                            if scope.locator(".mrc-modal-container").count() == 0:
+                                                logger.info("[二次验证] 短信发送确认成功，弹窗已关闭")
+                                                return False
+                                            logger.warning("[二次验证] 已点击短信发送确认，但弹窗仍在，继续等待页面结果")
+                                            return True
+
+                                        code = re.sub(r"\D+", "", str(secondary_input.get("code") or ""))[:8]
+                                        if not code:
+                                            time.sleep(2)
+                                            continue
+
+                                        logger.info("[二次验证] 已收到控制台提交的短信验证码，准备填写")
+                                        filled = False
+                                        input_selectors = [
+                                            "input[placeholder*='验证码']",
+                                            "input[maxlength='6']",
+                                            "input[maxlength='4']",
+                                            "input[type='tel']",
+                                            "input[type='text']",
+                                        ]
+                                        for target in _scopes(pw_page):
+                                            for selector in input_selectors:
+                                                try:
+                                                    inputs = target.locator(selector)
+                                                    for index in range(inputs.count()):
+                                                        item = inputs.nth(index)
+                                                        if not item.is_visible(timeout=500):
+                                                            continue
+                                                        item.fill(code, timeout=2000)
+                                                        filled = True
+                                                        break
+                                                    if filled:
+                                                        break
+                                                except Exception:
+                                                    continue
+                                            if filled:
+                                                break
+
+                                        if not filled:
+                                            logger.warning("[二次验证] 未找到短信验证码输入框，将继续等待")
+                                            time.sleep(2)
+                                            continue
+
+                                        clicked = False
+                                        for button_text in ("确定", "验证", "下一步", "完成", "登录"):
+                                            if _try_click_if_visible(pw_page, button_text, exact_text=False, timeout_ms=1500):
+                                                clicked = True
+                                                break
+                                        if not clicked:
+                                            try:
+                                                pw_page.keyboard.press("Enter")
+                                            except Exception:
+                                                pass
+
+                                        time.sleep(3)
+                                        _clear_secondary_status()
+                                        if scope.locator(".mrc-modal-container").count() == 0:
+                                            logger.info("[二次验证] 短信验证码验证成功，弹窗已关闭")
+                                            return False
+                                        logger.warning("[二次验证] 已提交短信验证码，但验证弹窗仍在，继续等待页面结果")
+                                        return True
+
+                                    logger.warning("[二次验证] 等待短信验证码超时")
+                                    return True
+                                except Exception as e:
+                                    logger.warning(f"[二次验证] 短信验证尝试失败：{e}")
+                                    continue
+                            return None
+
+                        def try_device_confirm() -> Optional[bool]:
+                            for j in range(option_count):
+                                try:
+                                    candidate = verification_options.nth(j)
+                                    candidate_text = candidate.locator("span.DwyRKeOe").first.inner_text(timeout=1000)
+                                    if "原设备确认" in candidate_text:
+                                        logger.info("[二次验证] 尝试点击「原设备确认」")
+                                        candidate.click()
+                                        logger.warning("[二次验证] 已发起原设备确认，请在网易云音乐 App/原登录设备上确认登录")
+                                        try:
+                                            setattr(pw_page, "_secondary_device_confirm_started_at", time.time())
+                                        except Exception:
+                                            pass
+                                        time.sleep(2)
+                                        if scope.locator(".mrc-modal-container").count() == 0:
+                                            logger.info("[二次验证] 原设备确认成功，弹窗已关闭")
+                                            return False
+                                        return True
+                                except Exception:
+                                    continue
+                            return None
+
+                        def try_scan_qr() -> Optional[bool]:
+                            for i in range(option_count):
+                                try:
+                                    option = verification_options.nth(i)
+                                    option_text = option.locator("span.DwyRKeOe").first.inner_text(timeout=1000)
+                                    if "原设备扫码验证" not in option_text:
+                                        continue
+                                    logger.info("[二次验证] 尝试点击「原设备扫码验证」并抓取 pollingToken")
+                                    try:
+                                        with pw_page.expect_response(
+                                            lambda r: "/weapi/login/origin-device/scan-apply/start" in r.url,
+                                            timeout=15000,
+                                        ) as resp_info:
+                                            option.click()
+                                        resp = resp_info.value
+                                        payload = resp.json()
+                                        polling_token = (
+                                            (payload or {})
+                                            .get("data", {})
+                                            .get("pollingToken")
+                                        )
+                                        if polling_token:
+                                            qr_uri = (
+                                                "orpheus://rnpage?"
+                                                "component=rn-account-verify&isTheme=true&immersiveMode=true&route=confirmOldDevice"
+                                                f"&pollingToken={polling_token}"
+                                            )
+                                            qr_url = (
+                                                "https://api.pwmqr.com/qrcode/create/?url="
+                                                + urllib.parse.quote(qr_uri, safe="")
+                                            )
+                                            logger.warning(f"[二次验证] 扫码二维码链接：{qr_url}")
+                                            try:
+                                                from wecom_notify import send_configured_notification
+
+                                                send_configured_notification(
+                                                    f"账号 {debug_phone or 'unknown'} 触发登录扫码验证，请尽快扫码：\n{qr_url}",
+                                                    title="网易音乐人登录扫码验证",
+                                                    event="login_qr",
+                                                    extra={"phone": debug_phone or "", "qr_url": qr_url},
+                                                )
+                                            except Exception as e:
+                                                logger.warning(f"[二次验证] 扫码二维码通知发送失败：{e}")
+                                            try:
+                                                setattr(pw_page, "_secondary_scan_started_at", time.time())
+                                            except Exception:
+                                                pass
+                                        else:
+                                            logger.warning(f"[二次验证] 未从接口返回中提取到 pollingToken：{payload}")
+                                    except Exception as e:
+                                        logger.warning(f"[二次验证] 监听 scan-apply/start 接口失败：{e}")
+                                        option.click()
+                                    return True
+                                except Exception:
+                                    continue
+                            return None
+
+                        if preferred_method in ("sms", "sms_code", "phone", "phone_code", "mobile"):
+                            res = try_sms_code()
+                            if res is not None:
+                                return res
+                            res = try_device_confirm()
+                            if res is not None:
+                                return res
+                            res = try_scan_qr()
+                            if res is not None:
+                                return res
+                        elif preferred_method in ("device_confirm", "confirm", "device"):
+                            res = try_device_confirm()
+                            if res is not None:
+                                return res
+                            res = try_scan_qr()
+                            if res is not None:
+                                return res
+                        else:
+                            res = try_scan_qr()
+                            if res is not None:
+                                return res
+                            res = try_device_confirm()
+                            if res is not None:
+                                return res
+
+                        # 保留旧扫码分支不可达前的注释，实际逻辑已移入 try_scan_qr。
+                        for i in range(0):
+                            try:
+                                option = verification_options.nth(i)
+                                option_text = option.locator("span.DwyRKeOe").first.inner_text(timeout=1000)
+                                if "原设备扫码验证" in option_text:
+                                    logger.info("[二次验证] 尝试点击「原设备扫码验证」并抓取 pollingToken")
+                                    try:
+                                        with pw_page.expect_response(
+                                            lambda r: "/weapi/login/origin-device/scan-apply/start" in r.url,
+                                            timeout=15000,
+                                        ) as resp_info:
+                                            option.click()
+                                        resp = resp_info.value
+                                        payload = resp.json()
+                                        polling_token = (
+                                            (payload or {})
+                                            .get("data", {})
+                                            .get("pollingToken")
+                                        )
+                                        if polling_token:
+                                            qr_uri = (
+                                                "orpheus://rnpage?"
+                                                "component=rn-account-verify&isTheme=true&immersiveMode=true&route=confirmOldDevice"
+                                                f"&pollingToken={polling_token}"
+                                            )
+                                            qr_url = (
+                                                "https://api.pwmqr.com/qrcode/create/?url="
+                                                + urllib.parse.quote(qr_uri, safe="")
+                                            )
+                                            logger.warning(f"[二次验证] 扫码二维码链接：{qr_url}")
+                                            try:
+                                                from wecom_notify import send_configured_notification
+
+                                                send_configured_notification(
+                                                    f"账号 {debug_phone or 'unknown'} 触发登录扫码验证，请尽快扫码：\n{qr_url}",
+                                                    title="网易音乐人登录扫码验证",
+                                                    event="login_qr",
+                                                    extra={"phone": debug_phone or "", "qr_url": qr_url},
+                                                )
+                                            except Exception as e:
+                                                logger.warning(f"[二次验证] 扫码二维码通知发送失败：{e}")
+                                            # 标记：已进入扫码验证流程，后续应至少等待一段时间给用户扫码
+                                            try:
+                                                setattr(pw_page, "_secondary_scan_started_at", time.time())
+                                            except Exception:
+                                                pass
+                                        else:
+                                            logger.warning(f"[二次验证] 未从接口返回中提取到 pollingToken：{payload}")
+                                    except Exception as e:
+                                        logger.warning(f"[二次验证] 监听 scan-apply/start 接口失败：{e}")
+                                        option.click()
+                                    return True
+                            except Exception:
+                                continue
+
+                        # 其次：原设备确认（有些情况还需要再输入验证码，成功率不如扫码）
+                        for i in range(option_count):
+                            try:
+                                option = verification_options.nth(i)
+                                option_text = option.locator("span.DwyRKeOe").first.inner_text(timeout=1000)
+                                if "原设备确认" in option_text:
+                                    logger.info("[二次验证] 尝试点击「原设备确认」")
+                                    option.click()
+                                    time.sleep(2)
+                                    # 检查弹窗是否消失
+                                    if scope.locator(".mrc-modal-container").count() == 0:
+                                        logger.info("[二次验证] 原设备确认成功，弹窗已关闭")
+                                        return False
+                                    break
+                            except Exception:
+                                continue
+                        
+                        # 如果自动处理失败，记录需要手动处理
+                        logger.warning(
+                            "[二次验证] 无法自动完成二次验证，请手动选择验证方式：\n"
+                            "  - 短信验证\n"
+                            "  - 原设备确认\n"
+                            "  - 原设备扫码验证\n"
+                            "  - 微信授权验证"
+                        )
+                        return True
+                    
+            except Exception:
+                continue
+        
+        time.sleep(0.5)
+    
+    logger.debug("[二次验证] 未检测到二次验证弹窗")
+    return False
+
+
+def do_login_with_phone(page: Page | Frame, phone: str, password: str):
+    """
+    按你给的 DOM/文字说明，依次点击：
+    1. 选择其他登录模式
+    2. 勾选协议
+    3. 手机号登录/注册
+    4. 密码登录
+    5. 输入手机号、密码
+    6. 点击登录
+    """
+    # 1. 点击「选择其他登录模式」
+    _click_first(page, "选择其他登录模式", exact_text=True)
+    logger.info("已点击「选择其他登录模式」")
+
+    # 2. 勾选协议复选框
+    _check_first(page, "#j-official-terms")
+    logger.info("已勾选协议复选框")
+
+    # 3. 点击「手机号登录/注册」
+    _click_first(page, "a:has(div:has-text('手机号登录/注册'))")
+    logger.info("已点击「手机号登录/注册」")
+
+    # 4. 等弹窗出来，点击「密码登录」
+    # 注意：这一步经常出现在主文档的弹窗里，所以要重新在所有 scope 中找
+    # 有时文案/空格会有细微变化，先尝试精确文本，再退回到模糊 text 选择器
+    try:
+        _click_first(page, "密码登录", exact_text=True, timeout=20000)
+        logger.info("已点击「密码登录」（精确匹配）")
+    except Exception as e:
+        logger.warning(f"精确文本『密码登录』点击失败，改用模糊匹配：{e}")
+        _click_first(page, "text=密码登录", exact_text=False, timeout=20000)
+        logger.info("已点击「密码登录」（模糊匹配）")
+    time.sleep(random.uniform(0.2, 0.5))
+
+    # 5. 输入手机号
+    _fill_first(page, "input[placeholder='请输入手机号']", phone)
+    logger.info("已输入手机号")
+    time.sleep(random.uniform(0.2, 0.5))
+
+    # 6. 输入密码
+    _fill_first(page, "input[placeholder='请输入密码']", password)
+    logger.info("已输入密码")
+    time.sleep(random.uniform(0.2, 0.5))
+
+    # 7. 点击「登录」
+    _click_first(page, "a:has(div:has-text('登录'))")
+    logger.info("已点击「登录」")
+
+
+def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, headless: bool = True) -> str:
+    """
+    供核心逻辑调用的通用浏览器登录函数：
+    - 使用 Playwright 完成手机号+密码登录（含滑块）
+    - 返回 cookie_str，后续由 core.AuthManager 负责写入 Redis 等
+    """
+    if not phone or not password:
+        raise ValueError("phone/password 不能为空")
+
+    os.makedirs(os.path.join(_PROJECT_ROOT, "log"), exist_ok=True)
+    profile_dir = os.path.join(profile_dir, phone)
+    with sync_playwright() as p:
+        # 反检测配置（保守版本，避免破坏页面功能）
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=headless,
+            viewport={"width": 1280, "height": 800},
+            # 模拟真实浏览器环境
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            # 容器环境必需参数
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+        # 基础反检测脚本
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            delete window.cdc_asyncScript;
+            delete window.cdc_file;
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+        page = context.new_page()
+
+        logger.info(f"使用 Playwright 打开登录页，账号：{phone}")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+
+        logger.info("开始执行自动登录流程（main frame + 所有 iframe 自动探测）...")
+        try:
+            do_login_with_phone(page, phone, password)
+        except Exception:
+            save_login_debug_screenshot(page, phone, "login_flow_error")
+            context.close()
+            raise
+
+        try:
+            solve_slider_captcha(page, debug_phone=phone)
+        except NeteaseLoginNetworkRiskError:
+            context.close()
+            raise
+        except Exception as e:
+            logger.warning(f"滑块验证码处理过程出错：{e}")
+            save_login_debug_screenshot(page, phone, "slider_exception")
+
+        # 少数情况下：滑块成功后会回到「密码登录」选项卡，需要重新点并再次触发滑块
+        # 这里避免无条件重复 solve_slider_captcha()，否则会出现多次“未触发验证码”的日志与耗时
+        for _ in range(3):
+            time.sleep(1)
+            if not _try_click_if_visible(page, "密码登录", exact_text=True, timeout_ms=2500):
+                break
+            logger.info("[登录] 检测到密码登录选项卡再次出现，已重新点击「密码登录」，继续执行输入与登录")
+            time.sleep(random.uniform(0.2, 0.5))
+            _fill_first(page, "input[placeholder='请输入手机号']", phone)
+            time.sleep(random.uniform(0.2, 0.5))
+            _fill_first(page, "input[placeholder='请输入密码']", password)
+            time.sleep(random.uniform(0.2, 0.5))
+            _click_first(page, "a:has(div:has-text('登录'))", timeout=10000)
+            time.sleep(random.uniform(0.2, 0.5))
+            logger.info("[登录] 已重新输入账号密码并点击登录")
+
+            # 只有检测到滑块容器时才处理滑块
+            if _has_yidun_slider_modal(page):
+                try:
+                    solve_slider_captcha(page, debug_phone=phone)
+                except NeteaseLoginNetworkRiskError:
+                    context.close()
+                    raise
+                except Exception as e:
+                    logger.warning(f"滑块验证码处理过程出错：{e}")
+                    save_login_debug_screenshot(page, phone, "slider_exception")
+
+        try:
+            ensure_no_network_security_risk(page, where="登录重试结束后", debug_phone=phone)
+        except NeteaseLoginNetworkRiskError:
+            context.close()
+            raise
+
+        # 滑块验证完成后，检查是否需要二次验证
+        try:
+            needs_secondary = check_secondary_verification(page, timeout=10, debug_phone=phone)
+            if needs_secondary:
+                logger.warning("[登录] 检测到需要二次验证，等待用户手动完成...")
+                # 扫码验证：最多等 60 秒，每 5 秒检查一次；用户提前完成就立刻继续
+                try:
+                    started_at = getattr(page, "_secondary_scan_started_at", None)
+                except Exception:
+                    started_at = None
+                if started_at:
+                    logger.warning("[登录] 已生成扫码二维码链接，开始轮询等待（每 5 秒检查一次，最多 60 秒）...")
+                    scan_deadline = time.time() + 60
+                    while time.time() < scan_deadline:
+                        # 被动检测：不重复点击/不重复生成二维码
+                        still_needs_scan = check_secondary_verification(
+                            page,
+                            timeout=2,
+                            auto_action=False,
+                            debug_phone=phone,
+                        )
+                        if not still_needs_scan:
+                            logger.info("[登录] 二次验证已完成（扫码），继续登录流程")
+                            break
+                        time.sleep(5)
+
+                # 循环检查，最多等待 120 秒，直到二次验证弹窗消失（被动检测）
+                secondary_deadline = time.time() + 120
+                while time.time() < secondary_deadline:
+                    still_needs = check_secondary_verification(
+                        page,
+                        timeout=2,
+                        auto_action=False,
+                        debug_phone=phone,
+                    )
+                    if not still_needs:
+                        logger.info("[登录] 二次验证已完成，继续登录流程")
+                        break
+                    time.sleep(2)
+                else:
+                    logger.warning("[登录] 二次验证等待超时，继续尝试获取 Cookie")
+                    save_login_debug_screenshot(page, phone, "secondary_verify_timeout")
+        except Exception as e:
+            logger.warning(f"检查二次验证时出错：{e}")
+            save_login_debug_screenshot(page, phone, "secondary_verify_error")
+
+        deadline = time.time() + 60
+        cookie_str = ""
+        login_cookie_ok = False
+        while time.time() < deadline:
+            cookies = context.cookies("https://music.163.com")
+            cookie_str = cookies_to_cookie_str(cookies)
+
+            has_music_u = any(c.get("name") == "MUSIC_U" and c.get("value") for c in cookies)
+            has_csrf = any(c.get("name") == "__csrf" and c.get("value") for c in cookies)
+            if has_music_u or has_csrf:
+                login_cookie_ok = True
+                break
+            time.sleep(1)
+
+        if not login_cookie_ok:
+            save_login_debug_screenshot(page, phone, "no_login_cookie")
+
+        context.close()
+
+        if not cookie_str or not login_cookie_ok:
+            raise RuntimeError("浏览器登录未获取到任何 Cookie，请检查是否登录成功。")
+
+        return cookie_str
+
+
+def main():
+    """
+    作为独立脚本运行时：
+    - 使用上面的 PHONE / PASSWORD 登录
+    - 自动识别 uid
+    - 调用 core.AuthManager 写入 Redis
+    """
+    from core import AuthManager, NeteaseClient  # 延迟导入避免循环
+
+    cookie_str = browser_login(PHONE, PASSWORD, PROFILE_DIR,headless)
+
+    uid = FIXED_UID or try_get_uid_from_cookie(cookie_str)
+    if not uid:
+        logger.warning("未能自动识别 uid，如需写入 Redis，请在文件顶部设置 FIXED_UID = 你的 uid。")
+    else:
+        logger.info(f"识别到 uid={uid}")
+
+    if uid:
+        auth = AuthManager()
+        user_data = {}
+        try:
+            client = NeteaseClient(cookie_str=cookie_str, uid=uid)
+            user_data = client.request("GET", f"/api/v1/user/detail/{uid}", encrypt=False) or {}
+        except Exception:
+            user_data = {}
+
+        ok = auth._save_session(uid, cookie_str, user_data)
+        if not ok:
+            raise SystemExit("写入 Redis 失败：请检查 REDIS_URL 配置与 Redis 连接。")
+        logger.info(f"已写入 Redis：netease:music:user:{uid}:cookie")
+
+    logger.info("完成。你现在可以运行 main.py/core.py 的任务逻辑，会优先使用这份 cookie。")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3:
+        PHONE = sys.argv[1]
+        PASSWORD = sys.argv[2]
+        headless = sys.argv[3] == "True"
+    else:
+        PHONE = input("手机号：")
+        PASSWORD = input("密码：")
+        headless = input("headless yes?：") == "yes"
+
+    # 执行主函数
+    main()

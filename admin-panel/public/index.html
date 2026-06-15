@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>网易音乐人任务控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section id="loginView" class="login">
+        <h1>网易音乐人任务控制台</h1>
+        <form id="loginForm" class="panel compact">
+          <label>
+            管理密码
+            <input name="password" type="text" autocomplete="off" spellcheck="false" required />
+          </label>
+          <button type="submit">登录</button>
+          <p id="loginError" class="error"></p>
+        </form>
+      </section>
+
+      <section id="appView" class="app hidden">
+        <header class="topbar">
+          <div>
+            <h1>网易音乐人任务控制台</h1>
+            <p>Self-hosted · Docker + Redis</p>
+          </div>
+          <div class="actions">
+            <button id="refreshBtn" type="button">刷新</button>
+            <button id="runBtn" type="button">立即运行</button>
+            <button id="stopRunBtn" type="button" class="danger">强制停止</button>
+            <button id="restartBtn" type="button">重启任务</button>
+          </div>
+        </header>
+
+        <section class="panel statusPanel">
+          <h2>运行状态</h2>
+          <div id="runStatus" class="statusText">空闲</div>
+          <div id="qrBox" class="qrBox hidden">
+            <img id="qrImage" alt="登录安全验证二维码" />
+            <a id="qrLink" href="#" target="_blank" rel="noreferrer">打开二维码链接</a>
+          </div>
+          <form id="smsBox" class="smsBox hidden">
+            <div id="smsInstruction" class="smsInstruction hidden">
+              <div>请用绑定手机号发送短信</div>
+              <strong id="smsText"></strong>
+              <span>到</span>
+              <strong id="smsTo"></strong>
+            </div>
+            <label id="smsCodeLabel">
+              手机验证码
+              <input id="smsCodeInput" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" placeholder="输入短信验证码" />
+            </label>
+            <button id="smsSubmitBtn" type="submit">提交验证码</button>
+            <button id="smsSentBtn" type="button" class="secondary hidden">我已发送短信</button>
+            <span id="smsHint"></span>
+          </form>
+        </section>
+
+        <section class="grid">
+          <form id="settingsForm" class="panel">
+            <h2>任务设置</h2>
+            <div class="formGrid">
+              <label>每日执行时间 <input name="SEND_TIME" placeholder="09:30" /></label>
+              <label>分享间隔天数 <input name="EXECUTION_INTERVAL_DAYS" type="number" min="1" /></label>
+              <label>每月最多分享 <input name="MAX_MONTHLY_SENDS" type="number" min="1" /></label>
+              <label>登录方式
+                <select name="LOGIN_METHOD">
+                  <option value="playwright">playwright</option>
+                  <option value="api">api</option>
+                </select>
+              </label>
+              <label>二次验证方式
+                <select name="SECONDARY_VERIFY_METHOD">
+                  <option value="sms">手机验证码</option>
+                  <option value="device_confirm">原设备确认</option>
+                  <option value="scan_qr">原设备扫码</option>
+                </select>
+              </label>
+              <label>Cookie 有效天数 <input name="COOKIE_EXPIRE_DAYS" type="number" min="1" /></label>
+              <label>到期提醒天数 <input name="COOKIE_NOTIFY_BEFORE_DAYS" type="number" min="0" /></label>
+            </div>
+            <h2>通知设置</h2>
+            <div class="formGrid">
+              <label>企业微信 Webhook Key <input name="WECOM_WEBHOOK_KEY" /></label>
+              <label>自定义 Webhook URL <input name="CUSTOM_WEBHOOK_URL" /></label>
+              <label>自定义 Webhook Method <input name="CUSTOM_WEBHOOK_METHOD" placeholder="POST" /></label>
+              <label>自定义 Webhook Headers <input name="CUSTOM_WEBHOOK_HEADERS" /></label>
+              <label>管理面板密码 <input name="ADMIN_PANEL_PASSWORD" type="password" /></label>
+            </div>
+            <button type="submit">保存设置并重启任务</button>
+          </form>
+
+          <section class="panel">
+            <h2>账号任务</h2>
+            <form id="userForm" class="userForm">
+              <input name="key" placeholder="任务名，例如 user1" required />
+              <input name="phone" placeholder="网易云账号/手机号" required />
+              <input name="password" type="password" placeholder="网易云密码" required />
+              <button type="submit">添加账号</button>
+            </form>
+            <div id="users" class="users"></div>
+          </section>
+        </section>
+
+        <section class="panel">
+          <h2>容器状态</h2>
+          <pre id="psBox"></pre>
+        </section>
+
+        <section class="panel">
+          <h2>日志</h2>
+          <pre id="logBox"></pre>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

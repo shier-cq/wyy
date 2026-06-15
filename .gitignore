@@ -1,0 +1,16 @@
+.env
+*.env
+!.env.example
+
+admin-panel-password.txt
+
+__pycache__/
+*.py[cod]
+
+log/
+debug/
+playwright_profiles/
+redis-data/
+
+.DS_Store
+Thumbs.db
