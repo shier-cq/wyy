@@ -273,14 +273,17 @@ async function recreateTaskContainer() {
   await dockerApi('POST', `/containers/${encodeURIComponent(taskContainer)}/start`);
 }
 
-async function startRunOnceJob() {
+async function startRunJob({ mode = 'once' } = {}) {
   const name = `netease-musician-run-${Date.now()}`;
+  const isPublishOnly = mode === 'publish';
   activeRunContainer = name;
   runJob = {
     running: true,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    output: '后台任务已启动，正在执行 python main.py --once ...',
+    output: isPublishOnly
+      ? '发布动态任务已启动，正在执行 interval_task_runner ...'
+      : '后台任务已启动，正在执行 python main.py --once ...',
     error: '',
     qrUrl: '',
     logStartBytes: await fileSize('/project/log/netease_music.log'),
@@ -293,7 +296,13 @@ async function startRunOnceJob() {
     await dockerApi('POST', `/containers/create?name=${encodeURIComponent(name)}`, {
       Image: taskImage,
       Env: envArrayFromSettings(settings),
-      Cmd: ['python', 'main.py', '--once'],
+      Cmd: isPublishOnly
+        ? [
+            'python',
+            '-c',
+            "import sys; sys.argv=['manual_interval_publish','--once']; import main; main.logger.info('[panel] run interval publish task only'); main.interval_task_runner()",
+          ]
+        : ['python', 'main.py', '--once'],
       HostConfig: {
         AutoRemove: false,
         ShmSize: taskShmSize,
@@ -330,6 +339,14 @@ async function startRunOnceJob() {
     runJob.running = false;
     runJob.finishedAt = new Date().toISOString();
   }
+}
+
+async function startRunOnceJob() {
+  return startRunJob({ mode: 'once' });
+}
+
+async function startPublishJob() {
+  return startRunJob({ mode: 'publish' });
 }
 
 function extractQrUrl(text) {
@@ -473,6 +490,23 @@ app.post('/api/run-once', { preHandler: requireAuth }, async () => {
     return runJob;
   }
   startRunOnceJob();
+  return runJob;
+});
+
+app.post('/api/run-publish', { preHandler: requireAuth }, async () => {
+  if (containerBusy) {
+    return {
+      running: false,
+      startedAt: null,
+      finishedAt: new Date().toISOString(),
+      output: '任务容器正在保存设置或重启中，请稍后再运行。',
+      error: 'container_busy',
+    };
+  }
+  if (runJob.running) {
+    return runJob;
+  }
+  startPublishJob();
   return runJob;
 });
 

@@ -8,6 +8,7 @@ const psBox = document.querySelector('#psBox');
 const loginError = document.querySelector('#loginError');
 const runStatus = document.querySelector('#runStatus');
 const runBtn = document.querySelector('#runBtn');
+const publishBtn = document.querySelector('#publishBtn');
 const stopRunBtn = document.querySelector('#stopRunBtn');
 const qrBox = document.querySelector('#qrBox');
 const qrImage = document.querySelector('#qrImage');
@@ -138,6 +139,7 @@ function renderRunStatus(status) {
   if (!status.running && !status.startedAt) {
     runStatus.textContent = '空闲';
     runBtn.disabled = false;
+    publishBtn.disabled = false;
     stopRunBtn.disabled = true;
     return;
   }
@@ -145,6 +147,7 @@ function renderRunStatus(status) {
   if (status.running) {
     runStatus.textContent = `运行中，开始于 ${new Date(status.startedAt).toLocaleTimeString()}`;
     runBtn.disabled = true;
+    publishBtn.disabled = true;
     stopRunBtn.disabled = false;
     setLog(status.output || '后台任务正在执行...');
     return;
@@ -152,6 +155,7 @@ function renderRunStatus(status) {
 
   runStatus.textContent = `已结束，结束于 ${new Date(status.finishedAt).toLocaleTimeString()}`;
   runBtn.disabled = false;
+  publishBtn.disabled = false;
   stopRunBtn.disabled = true;
   if (status.output) setLog(status.output);
 }
@@ -218,6 +222,12 @@ runBtn.addEventListener('click', async () => {
   runBtn.disabled = true;
   setLog('后台任务启动中...');
   const status = await api('/api/run-once', { method: 'POST' });
+  renderRunStatus(status);
+});
+publishBtn.addEventListener('click', async () => {
+  publishBtn.disabled = true;
+  setLog('发布动态任务启动中...');
+  const status = await api('/api/run-publish', { method: 'POST' });
   renderRunStatus(status);
 });
 stopRunBtn.addEventListener('click', async () => {
