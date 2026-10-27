@@ -91,6 +91,16 @@ async function readEnv() {
   return data;
 }
 
+function normalizeSendTime(value) {
+  const time = String(value || '').trim().replace('：', ':');
+  const match = time.match(/^(\d{1,2}):(\d{1,2})$/);
+  if (!match) return '';
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return '';
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 async function writeEnv(updates) {
   const existing = await readEnv();
   const next = {
@@ -101,6 +111,11 @@ async function writeEnv(updates) {
 
   for (const key of settingKeys) {
     if (Object.hasOwn(updates, key)) next[key] = String(updates[key] ?? '');
+  }
+  if (Object.hasOwn(updates, 'SEND_TIME')) {
+    const normalized = normalizeSendTime(updates.SEND_TIME);
+    if (!normalized) throw new Error('每日执行时间格式必须是 HH:MM，例如 13:10。');
+    next.SEND_TIME = normalized;
   }
 
   const orderedKeys = [
@@ -113,7 +128,7 @@ async function writeEnv(updates) {
   await fs.writeFile(envFilePath, `${lines.join('\n')}\n`, 'utf8');
 }
 
-function dockerApi(method, path, body, responseType = 'json') {
+function dockerApi(method, path, body, responseType = 'json', timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const payload = body ? Buffer.from(JSON.stringify(body)) : null;
     const request = http.request({
@@ -123,7 +138,7 @@ function dockerApi(method, path, body, responseType = 'json') {
       headers: payload
         ? { 'Content-Type': 'application/json', 'Content-Length': payload.length }
         : undefined,
-      timeout: 120000,
+      timeout: timeoutMs,
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
@@ -316,11 +331,11 @@ async function startRunJob({ mode = 'once' } = {}) {
       },
     });
     await dockerApi('POST', `/containers/${encodeURIComponent(name)}/start`);
-    const runPromise = dockerApi('POST', `/containers/${encodeURIComponent(name)}/wait`, null)
+    const runPromise = dockerApi('POST', `/containers/${encodeURIComponent(name)}/wait`, null, 'json', 960000)
       .then(async () => containerLogs(name, 500));
-    const timeoutPromise = sleep(420000).then(async () => {
+    const timeoutPromise = sleep(900000).then(async () => {
       await dockerApi('POST', `/containers/${encodeURIComponent(name)}/kill`).catch(() => {});
-      return '后台任务超过 420 秒，已自动停止临时运行容器。';
+      return '后台任务超过 900 秒，已自动停止临时运行容器。';
     });
     const output = await Promise.race([runPromise, timeoutPromise]);
     runJob.output = output || '任务执行结束，但没有返回输出。';
@@ -454,8 +469,9 @@ app.post('/api/settings', { preHandler: requireAuth }, async (request) => {
   }
   containerBusy = true;
   try {
-  await writeEnv(request.body || {});
-  return { ok: true };
+    await writeEnv(request.body || {});
+    await recreateTaskContainer();
+    return { ok: true, message: '设置已保存，任务容器已按新配置重启。' };
   } finally {
     containerBusy = false;
   }

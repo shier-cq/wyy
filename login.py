@@ -53,6 +53,7 @@ SECONDARY_INPUT_PATH = os.getenv(
     "SECONDARY_INPUT_PATH",
     os.path.join(_PROJECT_ROOT, "debug", "secondary_input.json"),
 )
+_SECONDARY_NOTIFY_CACHE: dict[str, float] = {}
 
 
 # ======== 工具函数 ========
@@ -211,6 +212,29 @@ def _write_secondary_status(payload: dict) -> None:
         os.replace(tmp_path, SECONDARY_STATUS_PATH)
     except Exception as e:
         logger.warning(f"[二次验证] 写入状态文件失败：{e}")
+
+
+def _notify_secondary_verification(message: str, *, phone: str = "", method: str = "unknown", extra: dict | None = None) -> None:
+    key = f"{phone}:{method}:{message}"
+    now = time.time()
+    last_sent = _SECONDARY_NOTIFY_CACHE.get(key, 0)
+    if now - last_sent < 300:
+        return
+    _SECONDARY_NOTIFY_CACHE[key] = now
+    try:
+        from wecom_notify import send_configured_notification
+
+        content = message
+        if phone:
+            content = f"账号：{phone}\n{message}"
+        send_configured_notification(
+            content,
+            title="网易音乐人需要二次验证",
+            event="secondary_verification",
+            extra={"phone": phone, "method": method, **(extra or {})},
+        )
+    except Exception as e:
+        logger.warning(f"[二次验证] Webhook 通知发送失败：{e}")
 
 
 def _clear_secondary_status() -> None:
@@ -636,6 +660,11 @@ def check_secondary_verification(
                 if modal.count() > 0:
                     logger.warning("[二次验证] 检测到登录安全验证弹窗，需要额外验证")
                     pw_page: Page = page if isinstance(page, Page) else page.page
+                    _notify_secondary_verification(
+                        "检测到登录安全验证弹窗，需要额外验证。请打开后台处理验证码、原设备确认或扫码确认。",
+                        phone=debug_phone or "",
+                        method="detected",
+                    )
 
                     if not auto_action:
                         return True
@@ -688,12 +717,27 @@ def check_secondary_verification(
                                         }
                                     )
                                     if sms_instruction:
+                                        _notify_secondary_verification(
+                                            (
+                                                "需要短信二次验证。\n"
+                                                f"请用绑定手机号发送短信 {sms_instruction['smsText']} 到 {sms_instruction['smsTo']}，"
+                                                "发送后到后台点击已发送。"
+                                            ),
+                                            phone=debug_phone or "",
+                                            method="sms_send",
+                                            extra=sms_instruction,
+                                        )
                                         logger.warning(
                                             "[二次验证] 请用绑定手机号发送短信 "
                                             f"{sms_instruction['smsText']} 到 {sms_instruction['smsTo']}，"
                                             "发送后在控制台点击已发送"
                                         )
                                     else:
+                                        _notify_secondary_verification(
+                                            "需要短信验证码二次验证。请打开后台输入收到的手机验证码。",
+                                            phone=debug_phone or "",
+                                            method="sms_code",
+                                        )
                                         logger.warning("[二次验证] 已触发短信验证，请在控制台输入收到的手机验证码")
 
                                     deadline = time.time() + 300
@@ -775,6 +819,11 @@ def check_secondary_verification(
                                         return True
 
                                     logger.warning("[二次验证] 等待短信验证码超时")
+                                    _notify_secondary_verification(
+                                        "等待短信验证码超时，请重新触发任务并在后台完成验证。",
+                                        phone=debug_phone or "",
+                                        method="sms_timeout",
+                                    )
                                     return True
                                 except Exception as e:
                                     logger.warning(f"[二次验证] 短信验证尝试失败：{e}")
@@ -790,6 +839,11 @@ def check_secondary_verification(
                                         logger.info("[二次验证] 尝试点击「原设备确认」")
                                         candidate.click()
                                         logger.warning("[二次验证] 已发起原设备确认，请在网易云音乐 App/原登录设备上确认登录")
+                                        _notify_secondary_verification(
+                                            "已发起原设备确认，请在网易云音乐 App 或原登录设备上确认登录。",
+                                            phone=debug_phone or "",
+                                            method="device_confirm",
+                                        )
                                         try:
                                             setattr(pw_page, "_secondary_device_confirm_started_at", time.time())
                                         except Exception:
@@ -965,6 +1019,14 @@ def check_secondary_verification(
                             "  - 原设备确认\n"
                             "  - 原设备扫码验证\n"
                             "  - 微信授权验证"
+                        )
+                        _notify_secondary_verification(
+                            (
+                                "无法自动完成二次验证，请打开后台手动处理。\n"
+                                "可选方式通常包括：短信验证、原设备确认、原设备扫码验证或微信授权验证。"
+                            ),
+                            phone=debug_phone or "",
+                            method="manual_required",
                         )
                         return True
                     
